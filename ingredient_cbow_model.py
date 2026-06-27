@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 # Settings
 # ----------------------------
 
-CSV_PATH = Path("RecipeNLG_dataset.csv")
+CSV_PATH = Path("./RecipeNLG_dataset.csv")
 
 MAX_RECIPES = 50_000
 MIN_INGREDIENT_FREQ = 10
@@ -26,6 +26,8 @@ RANDOM_SEED = 46
 
 MODEL_OUTPUT_PATH = "ingredient_cbow_model.pt"
 VOCAB_OUTPUT_PATH = "ingredient_vocab.txt"
+ACCURACY_OUTPUT_PATH = "training_accuracy.csv"
+
 
 random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
@@ -233,6 +235,17 @@ def collate_batch(batch):
 
     return context_tensor, target_tensor
 
+def save_accuracy_history(history, filename):
+    """
+    Save per-epoch accuracy measurements to a CSV file.
+    """
+
+    df = pd.DataFrame(history)
+
+    df.to_csv(filename, index=False)
+
+    print(f"Saved accuracy history to {filename}")
+
 
 # ----------------------------
 # Model
@@ -277,32 +290,50 @@ class CBOWIngredientModel(nn.Module):
 # Evaluation
 # ----------------------------
 
-def evaluate_top_k(model, examples, k=10, max_examples=2000):
+def evaluate_top_k(model, examples, ks=(1, 5, 10), max_examples=2000):
     """
-    Measures whether the hidden ingredient appears in the model's top-k guesses.
-    This evaluates missing-ingredient prediction, not true substitution quality.
+    Computes Top-k accuracy for several values of k simultaneously.
+
+    Returns
+    -------
+    dict
+        Example:
+        {
+            1: 0.214,
+            5: 0.487,
+            10: 0.612
+        }
     """
     model.eval()
 
     sample = examples[:max_examples]
-    hits = 0
+
+    max_k = max(ks)
+    hits = {k: 0 for k in ks}
 
     with torch.no_grad():
         for context, target in sample:
+
             context_tensor = torch.tensor([context], dtype=torch.long)
 
             logits = model(context_tensor)
 
-            # Do not recommend ingredients already in the context
+            # Exclude ingredients already in the context
             for ingredient_id in context:
                 logits[0, ingredient_id] = float("-inf")
 
-            top_ids = torch.topk(logits, k=k).indices[0].tolist()
+            max_k_used = min(max_k, logits.size(1))
 
-            if target in top_ids:
-                hits += 1
+            top_ids = torch.topk(
+                logits,
+                k=max_k_used
+            ).indices[0].tolist()
 
-    return hits / len(sample)
+            for k in ks:
+                if target in top_ids[:min(k, len(top_ids))]:
+                    hits[k] += 1
+
+    return {k: hits[k] / len(sample) for k in ks}
 
 
 # ----------------------------
@@ -372,6 +403,49 @@ def recommend_candidates(
 
     return results
 
+# ----------------------------
+# Random recipe utilities
+# ----------------------------
+
+def choose_random_recipe(recipe_ids):
+    """
+    Randomly select one recipe from the recipes remaining after
+    vocabulary filtering.
+
+    Parameters
+    ----------
+    recipe_ids : list[list[int]]
+        List of recipes represented as ingredient IDs.
+
+    Returns
+    -------
+    list[int]
+        A randomly selected recipe.
+    """
+    if not recipe_ids:
+        raise ValueError("recipe_ids is empty.")
+
+    return random.choice(recipe_ids)
+
+
+def choose_random_ingredient(recipe):
+    """
+    Randomly select one ingredient from a recipe.
+
+    Parameters
+    ----------
+    recipe : list[int]
+        A recipe represented as ingredient IDs.
+
+    Returns
+    -------
+    int
+        The selected ingredient ID.
+    """
+    if not recipe:
+        raise ValueError("recipe is empty.")
+
+    return random.choice(recipe)
 
 # ----------------------------
 # Main script
@@ -416,6 +490,7 @@ def main():
     loss_function = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
+    accuracy_history = []
     print("\nTraining model...")
 
     for epoch in range(EPOCHS):
@@ -437,17 +512,27 @@ def main():
 
         average_loss = total_loss / len(train_loader)
 
-        top_10_accuracy = evaluate_top_k(
+        accuracies = evaluate_top_k(
             model,
             test_examples,
-            k=10,
+            ks=(1, 5, 10),
             max_examples=1000
         )
+
+        accuracy_history.append({
+            "epoch": epoch + 1,
+            "loss": average_loss,
+            "top1_accuracy": accuracies[1],
+            "top5_accuracy": accuracies[5],
+            "top10_accuracy": accuracies[10]
+        })
 
         print(
             f"Epoch {epoch + 1}/{EPOCHS} | "
             f"loss = {average_loss:.4f} | "
-            f"test top-10 accuracy = {top_10_accuracy:.3f}"
+            f"Top-1 = {accuracies[1]:.3f} | "
+            f"Top-5 = {accuracies[5]:.3f} | "
+            f"Top-10 = {accuracies[10]:.3f}"
         )
 
     torch.save(
@@ -461,29 +546,32 @@ def main():
     )
 
     print(f"\nSaved model to {MODEL_OUTPUT_PATH}")
+    save_accuracy_history(
+    accuracy_history,
+    ACCURACY_OUTPUT_PATH
+    )
 
     # Demo example
-    print("\nExample recommendation:")
-
-    demo_recipe = [
-        "flour",
-        "sugar",
-        "egg",
-        "vanilla",
-        "butter"
+    random_recipe = choose_random_recipe(recipe_ids)
+    recipe_names = [
+        id_to_ingredient[i]
+        for i in random_recipe
     ]
 
-    removed = "butter"
+    print("\nRandomized recipe:")
+    print(", ".join(recipe_names))
 
-    print("Recipe context:", demo_recipe)
-    print("Removed ingredient:", removed)
+    removed_id = choose_random_ingredient(random_recipe)
+    removed_name = id_to_ingredient[removed_id]
+
+    print("Removed ingredient:\n", removed_name)
 
     recommendations = recommend_candidates(
         model=model,
         ingredient_to_id=ingredient_to_id,
         id_to_ingredient=id_to_ingredient,
-        context_ingredients=demo_recipe,
-        removed_ingredient=removed,
+        context_ingredients=recipe_names,
+        removed_ingredient=removed_name,
         top_k=10
     )
 
