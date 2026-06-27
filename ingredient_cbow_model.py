@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from datetime import datetime
 
 
 # ----------------------------
@@ -28,6 +29,10 @@ MODEL_OUTPUT_PATH = "ingredient_cbow_model.pt"
 VOCAB_OUTPUT_PATH = "ingredient_vocab.txt"
 ACCURACY_OUTPUT_PATH = "training_accuracy.csv"
 
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+RECOMMENDATION_OUTPUT_PATH = (
+    f"recommendations_{timestamp}.csv"
+)
 
 random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
@@ -403,6 +408,93 @@ def recommend_candidates(
 
     return results
 
+def save_recommendations_csv(
+    filename,
+    model,
+    recipe_ids,
+    id_to_ingredient,
+    ingredient_to_id,
+):
+    """
+    Save one recommendation record for every recipe.
+
+    Columns:
+        recipe_names,
+        removed_name,
+        recommendation_1,
+        ...
+        recommendation_10
+    """
+
+    rows = []
+
+    for recipe in recipe_ids:
+
+        # Convert IDs to ingredient names
+        recipe_names = [
+            id_to_ingredient[i]
+            for i in recipe
+        ]
+
+        # Random ingredient to remove
+        removed_id = random.choice(recipe)
+        removed_name = id_to_ingredient[removed_id]
+
+        # Remove it from the recipe
+        context_names = [
+            name
+            for name in recipe_names
+            if name != removed_name
+        ]
+
+        # Get recommendations
+        recommendations = recommend_candidates(
+            model=model,
+            ingredient_to_id=ingredient_to_id,
+            id_to_ingredient=id_to_ingredient,
+            context_ingredients=context_names,
+            removed_ingredient=removed_name,
+            top_k=10
+        )
+
+        recommendation_names = [
+            ingredient
+            for ingredient, score in recommendations
+        ]
+
+        # Ensure exactly 10 recommendation columns
+        while len(recommendation_names) < 10:
+            recommendation_names.append("")
+
+        rows.append(
+            [
+                ", ".join(recipe_names),
+                removed_name,
+                *recommendation_names
+            ]
+        )
+
+    columns = [
+        "recipe_names",
+        "removed_name",
+        "recommendation_1",
+        "recommendation_2",
+        "recommendation_3",
+        "recommendation_4",
+        "recommendation_5",
+        "recommendation_6",
+        "recommendation_7",
+        "recommendation_8",
+        "recommendation_9",
+        "recommendation_10",
+    ]
+
+    df = pd.DataFrame(rows, columns=columns)
+
+    df.to_csv(filename, index=False)
+
+    print(f"Saved recommendations to {filename}")
+
 # ----------------------------
 # Random recipe utilities
 # ----------------------------
@@ -549,6 +641,13 @@ def main():
     save_accuracy_history(
     accuracy_history,
     ACCURACY_OUTPUT_PATH
+    )
+    save_recommendations_csv(
+    RECOMMENDATION_OUTPUT_PATH,
+    model,
+    recipe_ids,
+    id_to_ingredient,
+    ingredient_to_id,
     )
 
     # Demo example
