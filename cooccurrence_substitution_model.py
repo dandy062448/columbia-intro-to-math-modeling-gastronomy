@@ -203,6 +203,42 @@ def build_cooccurrence(recipes):
 # Recommendation
 # ----------------------------
 
+def clean_recipe_ingredients(recipe_ingredients):
+    """
+    Clean and deduplicate a raw list of ingredient strings the same way
+    the training data was cleaned.
+    """
+    cleaned_recipe = []
+    for item in recipe_ingredients:
+        cleaned = clean_ingredient(item)
+        if cleaned is not None:
+            cleaned_recipe.append(cleaned)
+    return list(dict.fromkeys(cleaned_recipe))
+
+
+def ingredient_in_recipe(cleaned_recipe, ingredient_to_substitute):
+    """
+    Check whether `ingredient_to_substitute` (after the same cleaning used
+    for the recipe) is actually present in the cleaned recipe.
+    """
+    target = clean_ingredient(ingredient_to_substitute)
+    return target is not None and target in cleaned_recipe
+
+
+def _prepare_context(cleaned_recipe, ingredient_to_substitute, cooccurrence):
+    """
+    Shared setup for both scoring methods: figure out the context
+    (recipe minus the substituted ingredient), which context ingredients
+    are actually known to the model, and which candidates should be
+    excluded from the results.
+    """
+    target = clean_ingredient(ingredient_to_substitute)
+    context = [item for item in cleaned_recipe if item != target]
+    known_context = [item for item in context if item in cooccurrence]
+    exclude = set(context) | {target}
+    return context, known_context, exclude
+
+
 def recommend_substitutes(
     cooccurrence,
     ingredient_counts,
@@ -212,49 +248,23 @@ def recommend_substitutes(
 ):
     """
     Recommend replacement ingredients for `ingredient_to_substitute`,
-    based on which ingredients most frequently co-occur with the *rest*
-    of the recipe (i.e. the recipe with that ingredient removed).
-
-    Parameters
-    ----------
-    cooccurrence : dict[str, Counter]
-        Output of build_cooccurrence().
-    ingredient_counts : Counter
-        Output of build_cooccurrence().
-    recipe_ingredients : list[str]
-        The full recipe, as raw ingredient strings.
-    ingredient_to_substitute : str
-        The ingredient the user wants to replace.
-    top_k : int
-        How many recommendations to return.
+    ranked by raw co-occurrence count with the *rest* of the recipe
+    (i.e. the recipe with that ingredient removed).
 
     Returns
     -------
     list[tuple[str, float]]
         (ingredient, score) pairs, sorted by descending score.
     """
-    # Clean the recipe the same way the training data was cleaned
-    cleaned_recipe = []
-    for item in recipe_ingredients:
-        cleaned = clean_ingredient(item)
-        if cleaned is not None:
-            cleaned_recipe.append(cleaned)
-    cleaned_recipe = list(dict.fromkeys(cleaned_recipe))
+    cleaned_recipe = clean_recipe_ingredients(recipe_ingredients)
 
-    target = clean_ingredient(ingredient_to_substitute)
-
-    # The "context" is the recipe minus the ingredient being replaced
-    context = [item for item in cleaned_recipe if item != target]
-
-    known_context = [item for item in context if item in cooccurrence]
+    _, known_context, exclude = _prepare_context(
+        cleaned_recipe, ingredient_to_substitute, cooccurrence
+    )
 
     if not known_context:
         print("None of the remaining recipe ingredients were found in the dataset.")
         return []
-
-    # Ingredients to exclude from the results: anything already in the
-    # recipe, plus the ingredient being replaced.
-    exclude = set(context) | {target}
 
     scores = Counter()
     for context_ingredient in known_context:
@@ -267,8 +277,63 @@ def recommend_substitutes(
         print("No co-occurring candidates found for this recipe.")
         return []
 
-    top = scores.most_common(top_k)
-    return top
+    return scores.most_common(top_k)
+
+
+def recommend_substitutes_jaccard(
+    cooccurrence,
+    ingredient_counts,
+    recipe_ingredients,
+    ingredient_to_substitute,
+    top_k=TOP_K,
+):
+    """
+    Recommend replacement ingredients for `ingredient_to_substitute`,
+    ranked by Jaccard similarity with the *rest* of the recipe.
+
+    For a pair of ingredients (a, b):
+
+        jaccard(a, b) = cooccurrence(a, b) / (count(a) + count(b) - cooccurrence(a, b))
+
+    This normalizes raw co-occurrence by how common each ingredient is
+    overall, so very common ingredients (salt, sugar, flour, ...) don't
+    automatically dominate the recommendations just because they appear
+    in almost every recipe.
+
+    Returns
+    -------
+    list[tuple[str, float]]
+        (ingredient, score) pairs, sorted by descending score.
+    """
+    cleaned_recipe = clean_recipe_ingredients(recipe_ingredients)
+
+    _, known_context, exclude = _prepare_context(
+        cleaned_recipe, ingredient_to_substitute, cooccurrence
+    )
+
+    if not known_context:
+        print("None of the remaining recipe ingredients were found in the dataset.")
+        return []
+
+    scores = Counter()
+    for context_ingredient in known_context:
+        context_count = ingredient_counts[context_ingredient]
+
+        for candidate, count in cooccurrence[context_ingredient].items():
+            if candidate in exclude:
+                continue
+
+            union = context_count + ingredient_counts[candidate] - count
+            if union <= 0:
+                continue
+
+            scores[candidate] += count / union
+
+    if not scores:
+        print("No co-occurring candidates found for this recipe.")
+        return []
+
+    return scores.most_common(top_k)
 
 
 # ----------------------------
@@ -294,6 +359,70 @@ def build_model(csv_path=CSV_PATH, max_recipes=MAX_RECIPES, min_freq=MIN_INGREDI
 def parse_recipe_string(recipe_string):
     """Turn a comma-separated string of ingredients into a list."""
     return [item.strip() for item in recipe_string.split(",") if item.strip()]
+
+
+def get_recipe_from_user(initial_recipe_string=None):
+    """
+    Prompt the user for a recipe (or use a value already supplied via
+    --recipe on the first loop iteration) and return both the raw
+    ingredient list and the cleaned version used for validation/lookup.
+    Re-prompts if the recipe is empty or nothing survives cleaning.
+    """
+    recipe_string = initial_recipe_string
+
+    while True:
+        if recipe_string is None:
+            recipe_string = input(
+                "\nEnter your recipe's ingredients, separated by commas:\n> "
+            )
+
+        recipe_ingredients = parse_recipe_string(recipe_string)
+        cleaned_recipe = clean_recipe_ingredients(recipe_ingredients)
+
+        if cleaned_recipe:
+            return recipe_ingredients, cleaned_recipe
+
+        print("That recipe didn't contain any usable ingredients. Please try again.")
+        recipe_string = None
+
+
+def get_substitute_from_user(cleaned_recipe, initial_substitute=None):
+    """
+    Prompt the user for the ingredient to substitute and validate that it
+    is actually present in the (cleaned) recipe. Re-prompts until a valid
+    ingredient is given.
+    """
+    substitute_target = initial_substitute
+
+    while True:
+        if substitute_target is None:
+            substitute_target = input(
+                "\nWhich ingredient do you want to substitute?\n> "
+            ).strip()
+
+        if ingredient_in_recipe(cleaned_recipe, substitute_target):
+            return substitute_target
+
+        print(
+            f"Error: '{substitute_target}' was not found in the recipe you provided "
+            f"({', '.join(cleaned_recipe)}). Please enter an ingredient that is in the recipe."
+        )
+        substitute_target = None
+
+
+def print_recommendations(title, recommendations, substitute_target):
+    if recommendations:
+        print(f"\n{title} for '{substitute_target}':")
+        for rank, (ingredient, score) in enumerate(recommendations, start=1):
+            print(f"{rank}. {ingredient}   (score={score:.4f})" if isinstance(score, float)
+                  else f"{rank}. {ingredient}   (score={score})")
+    else:
+        print(f"\n{title}: no recommendations could be generated for this input.")
+
+
+def prompt_yes_no(question):
+    answer = input(f"\n{question} (y/n): ").strip().lower()
+    return answer.startswith("y")
 
 
 def main():
@@ -331,38 +460,51 @@ def main():
         max_recipes=args.max_recipes,
     )
 
-    # Get the recipe and substitution target, either from CLI args or
-    # by asking the user interactively.
-    recipe_string = args.recipe
-    if recipe_string is None:
-        recipe_string = input(
-            "\nEnter your recipe's ingredients, separated by commas:\n> "
+    # Only the first loop iteration can be pre-filled from CLI args;
+    # every later round always prompts interactively.
+    next_recipe_string = args.recipe
+    next_substitute = args.substitute
+
+    while True:
+        recipe_ingredients, cleaned_recipe = get_recipe_from_user(next_recipe_string)
+        substitute_target = get_substitute_from_user(cleaned_recipe, next_substitute)
+
+        # CLI-supplied values are only used once
+        next_recipe_string = None
+        next_substitute = None
+
+        print(f"\nRecipe: {', '.join(recipe_ingredients)}")
+        print(f"Ingredient to substitute: {substitute_target}")
+
+        cooccurrence_recs = recommend_substitutes(
+            cooccurrence,
+            ingredient_counts,
+            recipe_ingredients,
+            substitute_target,
+            top_k=TOP_K,
         )
-    recipe_ingredients = parse_recipe_string(recipe_string)
+        print_recommendations(
+            f"Top {TOP_K} substitution candidates (raw co-occurrence)",
+            cooccurrence_recs,
+            substitute_target,
+        )
 
-    substitute_target = args.substitute
-    if substitute_target is None:
-        substitute_target = input(
-            "\nWhich ingredient do you want to substitute?\n> "
-        ).strip()
+        jaccard_recs = recommend_substitutes_jaccard(
+            cooccurrence,
+            ingredient_counts,
+            recipe_ingredients,
+            substitute_target,
+            top_k=TOP_K,
+        )
+        print_recommendations(
+            f"Top {TOP_K} substitution candidates (Jaccard similarity)",
+            jaccard_recs,
+            substitute_target,
+        )
 
-    print(f"\nRecipe: {', '.join(recipe_ingredients)}")
-    print(f"Ingredient to substitute: {substitute_target}")
-
-    recommendations = recommend_substitutes(
-        cooccurrence,
-        ingredient_counts,
-        recipe_ingredients,
-        substitute_target,
-        top_k=TOP_K,
-    )
-
-    if recommendations:
-        print(f"\nTop {len(recommendations)} substitution candidates for '{substitute_target}':")
-        for rank, (ingredient, score) in enumerate(recommendations, start=1):
-            print(f"{rank}. {ingredient}   (co-occurrence score={score})")
-    else:
-        print("\nNo recommendations could be generated for this input.")
+        if not prompt_yes_no("Would you like to try another recipe and ingredient?"):
+            print("\nDone. Happy cooking!")
+            break
 
 
 if __name__ == "__main__":
